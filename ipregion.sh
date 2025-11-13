@@ -26,6 +26,7 @@ IPV6_ONLY=false
 PROXY_ADDR=""
 INTERFACE_NAME=""
 DEBUG=false
+AUTONOMOUS=false
 
 RESULT_JSON=""
 ARR_PRIMARY=()
@@ -56,17 +57,24 @@ STATUS_SERVER_ERROR="Server error"
 
 declare -A DEPENDENCIES=(
   [jq]="jq"
+  [ip]="iproute"
+  [ping]="iputils-ping"
   [curl]="curl"
   [column]="util-linux"
   [nslookup]="bind-utils"
 )
 
+#sed 's/["apt:ip"]="iproute2"/["dnf:ip"]="iproute"/'
 declare -A PACKAGE_MAPPING=(
+  #["dnf:ip"]="iproute"
+  ["apt:ip"]="iproute2"
+  ["apt:ping"]="iputils-ping"
   ["apt:nslookup"]="dnsutils"
   ["apt:column"]="bsdmainutils"
   ["pacman:nslookup"]="bind"
   ["dnf:nslookup"]="bind-utils"
   ["yum:nslookup"]="bind-utils"
+  ["apk:column"]="util-linux"
   ["termux:column"]="util-linux"
 )
 
@@ -78,7 +86,6 @@ declare -A PRIMARY_SERVICES=(
   [IPAPI_CO]="ipapi.co|ipapi.co|/{ip}/json"
   [CLOUDFLARE]="cloudflare.com|speed.cloudflare.com|/meta"
   [IFCONFIG_CO]="ifconfig.co|ifconfig.co|/country-iso?ip={ip}|plain"
-  [IP2LOCATION_IO]="ip2location.io|api.ip2location.io|/?ip={ip}"
   [IPLOCATION_COM]="iplocation.com|iplocation.com"
   [COUNTRY_IS]="country.is|api.country.is|/{ip}"
   [GEOAPIFY_COM]="geoapify.com|api.geoapify.com|/v1/ipinfo?&ip={ip}&apiKey=b8568cb9afc64fad861a69edbddb2658"
@@ -98,7 +105,6 @@ PRIMARY_SERVICES_ORDER=(
   "IPREGISTRY"
   "IPAPI_CO"
   "IFCONFIG_CO"
-  "IP2LOCATION_IO"
   "IPLOCATION_COM"
   "COUNTRY_IS"
   "GEOAPIFY_COM"
@@ -314,6 +320,7 @@ Options:
   -6, --ipv6           Test only IPv6
   -p, --proxy ADDR     Use SOCKS5 proxy (format: host:port)
   -i, --interface IF   Use specified network interface (e.g. eth1)
+  -y, --autonomous     Always install dependencies without asking the user
 
 Examples:
   $SCRIPT_NAME                       # Check all services with default settings
@@ -345,15 +352,75 @@ setup_debug() {
   return 0
 }
 
+
+
+#  Calling cases of grep_wrapper
+#  grep_wrapper '^lookup_'
+#  grep_wrapper -Fxq "$service_name_uppercase"
+#  grep_wrapper -F -x -o "$service"
+#  grep_wrapper -io "youtube premium is not available in your country" <<<"$response"
+#  grep_wrapper --perl '"sRequestCountry":"\K[^"]*' <<<"$response"
+#  grep_wrapper -i --perl -q 'any :"\K[^"]+' <<<"$response"
+
+
+# Check if our grep supports Perl Compatible Regular Expressions (PCRE)
+(echo 'AB' | grep -oP 'A\KB' >/dev/null 2>&1) && _GREP_HAS_PCRE=1 || _GREP_HAS_PCRE=0
+
 grep_wrapper() {
-  local grep_args=()
+  local use_perl=0
+  local clean_args=()
+  local pattern=""
 
-  if [[ "$1" == "--perl" ]]; then
-    grep_args+=("-oP")
-    shift
+  # Step 1: Parse all arguments to find the --perl flag.
+  for arg in "$@"; do
+    if [[ "$arg" == "--perl" ]]; then
+      use_perl=1
+    else
+      clean_args+=("$arg")
+    fi
+  done
+  
+  # Step 2: Apply logic based on whether the --perl flag was found.
+
+  # Branch 1: The --perl flag was not passed. Just call grep with the original arguments.
+  if [[ "$use_perl" -eq 0 ]]; then
+    grep "$@"
+
+  # Branch 2: --perl was passed, and the system grep has native PCRE support.
+  elif [[ "$use_perl" -eq 1 && "$_GREP_HAS_PCRE" -eq 1 ]]; then
+    # Pass the filtered arguments (without --perl) to grep with the -P flag.
+    grep -oP "${clean_args[@]}"
+
+  # Branch 3: --perl was passed, no PCRE support, and the regex (first "clean" argument) does not contain \K.
+  elif [[ "$use_perl" -eq 1 && "$_GREP_HAS_PCRE" -eq 0 && "${clean_args[0]}" != *"\\K"* ]]; then
+    echo "grep_wrapper fallback: Regex does not contain \\K, cannot emulate." >&2
+    return 2
+
+  # Branch 4: --perl was passed, no PCRE support, but the regex contains \K. The main emulation scenario.
+  elif [[ "$use_perl" -eq 1 && "$_GREP_HAS_PCRE" -eq 0 && "${clean_args[0]}" == *"\\K"* ]]; then
+    local regex="${clean_args[0]}"
+    local other_args=("${clean_args[@]:1}")
+
+    # Split the string using Bash Parameter Expansion (no external utilities).
+    # ${string%%substring*} - remove the longest suffix starting with substring.
+    local prefix="${regex%%\\K*}"
+    # ${string##*substring} - remove the longest prefix ending with substring.
+    local pattern="${regex##*\\K}"
+    
+    local full_pattern="${prefix}${pattern}"
+
+    # First, find the full match, then remove the prefix using awk.
+    grep -oE "$full_pattern" "${other_args[@]}" | awk -v p="$prefix" '{ sub(p, ""); print }'
+  
+  # Branch 5: Fallback branch. Warn and execute a direct grep call.
+  # In theory, execution should not reach here, but this makes the function more robust.
+  else
+    local args_str
+    args_str=$(printf " %q" "$@")
+    printf "WARNING: Unhandled case in grep_wrapper. Passing through. Args:%s\n" "$args_str" >&2
+    
+    grep "$@"
   fi
-
-  grep "${grep_args[@]}" "$@"
 }
 
 upload_debug() {
@@ -418,7 +485,7 @@ detect_package_manager() {
     fedora)
       pkg_manager="dnf"
       ;;
-    centos | rhel)
+    centos | rhel | almalinux)
       if is_command_available "dnf"; then
         pkg_manager="dnf"
       else
@@ -538,9 +605,13 @@ prompt_for_installation() {
     "$(color WARN 'Missing dependencies:')" \
     "$formatted_deps" \
     "$(color INFO 'Do you want to install them? [y/N]:')"
-
-  read -r response
-  response=${response,,}
+	
+  if [[ "$AUTONOMOUS" != true ]]; then
+	read -r response
+	response=${response,,}
+  else
+	response='yes'
+  fi
 
   case "$response" in
     y | yes)
@@ -702,6 +773,11 @@ parse_arguments() {
         log "$LOG_INFO" "Using interface: $INTERFACE_NAME"
         shift 2
         ;;
+      -y | --autonomous)
+        AUTONOMOUS=true
+        log "$LOG_INFO" "Autonomous mode is activated"
+        shift
+		;;
       *)
         error_exit "Unknown option: $1"
         ;;
@@ -1137,7 +1213,7 @@ curl_wrapper() {
   fi
 
   if [[ -n "$json" ]]; then
-    curl_args+=(--json "$json")
+	curl_args+=(-H "Content-Type: application/json" --data "$json")
   fi
 
   if [[ -n "$data" ]]; then
@@ -1257,9 +1333,6 @@ process_response() {
       ;;
     RIPE)
       jq_filter='.country'
-      ;;
-    IP2LOCATION_IO)
-      jq_filter='.country_code'
       ;;
     IPINFO_IO)
       jq_filter='.data.country'
@@ -1666,10 +1739,6 @@ lookup_maxmind() {
 
 lookup_ripe() {
   process_service "RIPE"
-}
-
-lookup_ip2location_io() {
-  process_service "IP2LOCATION_IO"
 }
 
 lookup_ipinfo_io() {

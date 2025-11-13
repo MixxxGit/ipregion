@@ -2,7 +2,7 @@ ARG SCRIPT_NAME=ipregion.sh
 ARG WORK_DIR=/app
 ARG USER=ipregion
 
-FROM alpine:3.21
+FROM alpine:latest
 
 ARG SCRIPT_NAME
 ARG WORK_DIR
@@ -13,8 +13,7 @@ RUN apk add --no-cache \
   jq \
   bash \
   util-linux \
-  iputils \
-  grep
+  iputils
 
 WORKDIR $WORK_DIR
 
